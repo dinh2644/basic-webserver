@@ -320,12 +320,23 @@ void handleThreads(int newSd) // handle request from proxy
     std::ifstream file(file_path, std::ios::binary | std::ios::ate);
     if (!file.is_open())
     {
-        std::string errorMsg = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        std::string errorBody = "<html><head><title>500 Internal Server Error</title></head>"
+                                "<body><h1>500 Internal Server Error</h1>"
+                                "<p>The server encountered an unexpected condition that prevented it from fulfilling the request.</p>"
+                                "<p>The file exists but could not be accessed.</p>"
+                                "</body></html>";
+
+        std::string errorMsg = "HTTP/1.1 500 Internal Server Error\r\n"
+                               "Content-Type: text/html\r\n"
+                               "Content-Length: " +
+                               std::to_string(errorBody.length()) + "\r\n"
+                                                                    "Connection: close\r\n\r\n" +
+                               errorBody;
+
         responseCodeStr = "500";
         std::cout << "server-response, " << responseCodeStr << ", "
                   << std::this_thread::get_id() << ", " << getCurrentTimestamp() << std::endl;
         send(socket_closer.sd, errorMsg.c_str(), errorMsg.length(), MSG_NOSIGNAL);
-        // std::cerr << "[WebServer] File exists but cannot be opened: " << file_path << "\n"; // debug
         return;
     }
 
@@ -384,6 +395,7 @@ void handleThreads(int newSd) // handle request from proxy
             break;
         }
     }
+    file.close();
     // std::cout << "[" << std::this_thread::get_id() << "] Response sent for: " << file_path << " on socket " << socket_closer.sd << "\n";
 }
 
