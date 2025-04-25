@@ -447,6 +447,7 @@ int main(int argc, char *argv[])
     std::cout << "Waiting for a client to connect..." << "\n";
 
     // SOMAXCONN defines the maximum number allowed to pass to listen() per system
+    // listen for up to SOMAXCONN requests at a time
     if (listen(serverSd, SOMAXCONN) < 0)
     {
         perror("Error listening on socket");
