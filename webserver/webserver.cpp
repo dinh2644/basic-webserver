@@ -23,10 +23,10 @@
 #include <vector>
 #include <mutex>
 #include <algorithm>
-#include <sstream> // For istringstream
-#include <chrono>  // For timestamps
-#include <iomanip> // For formatting timestamps
-#include <ctime>   // For time functions
+#include <sstream>
+#include <chrono>
+#include <iomanip>
+#include <ctime>
 
 // Globals
 int serverSd;
@@ -43,34 +43,38 @@ std::mutex clientSocketsMutex;
  *********************************************************** Helpers ***********************************************************
  */
 
-void removeClientSocket(int sd);
+void removeClientSocket(int sd)
+{
+    std::lock_guard<std::mutex> lock(clientSocketsMutex);
+    clientSockets.erase(std::remove(clientSockets.begin(), clientSockets.end(), sd), clientSockets.end());
+}
 
 // RAII for socket descriptor
 struct SocketCloser
 {
     int sd;
-    bool managed; // flag to indicate if this instance owns the socket management
+    bool managed;
 
-    SocketCloser(int socket_descriptor) : sd(socket_descriptor), managed(true) {}
-
-    // Prevent copying
+    SocketCloser(int socket_descriptor) : sd(socket_descriptor), managed(true) {} // Main constructor
+    // Disable copy construction & copy assignment (can't have multiple objects dealing with the same socket)
     SocketCloser(const SocketCloser &) = delete;
     SocketCloser &operator=(const SocketCloser &) = delete;
-
-    // Allow moving
+    // Move constructor (accepts an rvalue reference to another SocketCloser object)
+    // allows moving (w/o copying) e.g. SocketCloser some_var = SocketCloser(serverSd);
     SocketCloser(SocketCloser &&other) noexcept : sd(other.sd), managed(other.managed)
     {
-        other.managed = false; // transfer ownership
+        other.managed = false;
         other.sd = -1;
     }
+    // Move operator
     SocketCloser &operator=(SocketCloser &&other) noexcept
     {
         if (this != &other)
         {
             if (managed && sd >= 0)
-            { // clean up existing resource (if any)
+            {
                 close(sd);
-                removeClientSocket(sd); // remove from global list on move assignment cleanup too
+                removeClientSocket(sd);
             }
             sd = other.sd;
             managed = other.managed;
@@ -79,28 +83,17 @@ struct SocketCloser
         }
         return *this;
     }
-
+    // Destructor
     ~SocketCloser()
     {
-        if (managed && sd >= 0) // only close/remove if this instance manages the socket
+        if (managed && sd >= 0)
         {
-            std::cout << "Closing socket: " << sd << std::endl; // Debugging
+            // std::cout << "[Proxy ~SocketCloser] Closing client socket: " << sd << std::endl; // debugging
             close(sd);
-            removeClientSocket(sd); // remove from global list
+            removeClientSocket(sd);
         }
     }
 };
-
-void removeClientSocket(int sd)
-{
-    std::lock_guard<std::mutex> lock(clientSocketsMutex);
-    // std::cout << "Attempting to remove socket: " << sd << std::endl; // Debugging
-    clientSockets.erase(std::remove(clientSockets.begin(), clientSockets.end(), sd), clientSockets.end());
-    std::cout << "Current client sockets: "; // Debugging
-    // for (int s : clientSockets)
-    //     std::cout << s << " "; // Debugging
-    // std::cout << std::endl;    // Debugging
-}
 
 std::string getCurrentTimestamp()
 {
@@ -116,48 +109,19 @@ void signalHandler(int signum)
     std::cout << "\n[" << std::this_thread::get_id() << "] Web Server Signal " << signum << " received. Shutting down server safely...\n";
     serverRunning = false;
 
-    // Cause accept() to return by connecting to the server yourself (Optional)
-    // This prevents scenario if accept() is blocked indefinitely
-    std::cout << "Attempting to unblock accept()...\n"; // Debugging
-    int dummy_sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (dummy_sock >= 0)
-    {
-        sockaddr_in selfAddr;
-        bzero((char *)&selfAddr, sizeof(selfAddr));
-        selfAddr.sin_family = AF_INET;
-        inet_pton(AF_INET, "127.0.0.1", &selfAddr.sin_addr); // connect to localhost
-
-        selfAddr.sin_port = htons(8080); // make sure this matches the port in main()
-        // Set non-blocking connect to avoid hanging here if server already closed listen socket
-        int flags = fcntl(dummy_sock, F_GETFL, 0);
-        fcntl(dummy_sock, F_SETFL, flags | O_NONBLOCK);
-        connect(dummy_sock, (struct sockaddr *)&selfAddr, sizeof(selfAddr));
-        std::this_thread::sleep_for(std::chrono::milliseconds(50)); // brief pause (Wake up accept())
-        close(dummy_sock);
-        // std::cout << "Dummy socket closed.\n"; // Debugging
-    }
-    // else
-    // {
-    //     std::cerr << "Could not create dummy socket to unblock accept.\n"; // Debugging
-    // }
-
-    // --- New: Shutdown active client connections ---
+    // Shutdown active client connections
     std::cout << "[WebServer] Shutting down active client connections...\n";
     {
         std::lock_guard<std::mutex> lock(clientSocketsMutex);
-        // std::cout << "Sockets to shutdown: "; // Debugging
-        // for (int s : clientSockets)
-        //     std::cout << s << " "; // Debugging
-        // std::cout << std::endl;    // Debugging
-        for (int clientSd : clientSockets)
+        for (int sd : clientSockets)
         {
-            // std::cout << "Shutting down SD: " << clientSd << std::endl; // Debugging
-            if (shutdown(clientSd, SHUT_RDWR) < 0)
+            std::cout << "Shutting down SD: " << sd << std::endl; // debugging
+            if (shutdown(sd, SHUT_RDWR) < 0)                      // SHUT_RDWR = No more receptions or transmissions.
             {
-                // Only print perror if it wasn't expected (e.g., socket already closed)
-                // if (errno != ENOTCONN && errno != EPIPE) {
-                //     perror("[WebServer] shutdown error");
-                // }
+                if (errno != ENOTCONN && errno != EPIPE)
+                {
+                    perror("[WebServer] shutdown error");
+                }
             }
         }
     }
@@ -168,23 +132,23 @@ void signalHandler(int signum)
     std::cout << "[WebServer] Waiting for active worker threads to complete...\n";
     {
         std::lock_guard<std::mutex> lock(threadMutex);
-        // std::cout << "[WebServer] Joining " << threads.size() << " threads.\n"; // debug
+        std::cout << "[WebServer] Joining " << threads.size() << " threads.\n"; // debugging
 
         for (auto &t : threads)
         {
             if (t.joinable())
             {
-                // std::cout << "Joining thread " << t.get_id() << std::endl; // Debugging
+                std::cout << "Joining thread " << t.get_id() << std::endl; // debugging
                 t.join();
-                // std::cout << "Joined thread " << t.get_id() << std::endl; // Debugging
+                std::cout << "Joined thread " << t.get_id() << std::endl; // debugging
             }
             // else
             // {
-            //     std::cout << "Thread " << t.get_id() << " not joinable.\n"; // Debugging
+            //     std::cout << "Thread " << t.get_id() << " not joinable.\n"; // debugging
             // }
         }
         threads.clear();
-        // std::cout << "Threads vector cleared.\n"; // Debugging
+        std::cout << "Threads vector cleared.\n"; // debugging
     }
 
     std::cout << "[WebServer] Closing server listener socket...\n";
@@ -192,48 +156,48 @@ void signalHandler(int signum)
     {
         close(serverSd);
     }
-    std::cout << "[WebServer] -- Server shutdown complete --" << std::endl;
+    std::cout << "[WebServer] -- Web server shutdown complete --" << std::endl;
     exit(0);
 }
 
 inline bool fileExists(const std::string &fileName)
 {
-    struct stat buffer;
-    return (stat(fileName.c_str(), &buffer) == 0);
+    struct stat requestBuffer;
+    return (stat(fileName.c_str(), &requestBuffer) == 0);
 }
 
 /*
- *********************************************************** handleThreads ***********************************************************
+ *********************************************************** handleRequest ***********************************************************
  */
-void handleThreads(int newSd) // handle request from proxy
+void handleRequest(int clientSd)
 {
-    // RAII for socket descriptor - manages close() and removal from global list
-    SocketCloser socket_closer(newSd);
+    // RAII for socket descriptor
+    SocketCloser socket_closer(clientSd);
 
-    // std::cout << "[" << std::this_thread::get_id() << "] Handling connection on socket " << newSd << "\n"; // Debugging
-    std::string responseCodeStr = "500"; // for internal server error
+    // std::cout << "[" << std::this_thread::get_id() << "] Handling connection on socket " << clientSd << "\n"; // debugging
+    std::string responseCodeStr = "500";
 
     // Retrieve http request msg
     const int buffer_size = 8192;
-    char buffer[buffer_size] = {0};
-    ssize_t bytes_received = recv(socket_closer.sd, buffer, buffer_size - 1, MSG_NOSIGNAL); // MSG_NOSIGNAL to prevent crashing if proxy disconnects suddenly
+    char requestBuffer[buffer_size] = {0};
+    ssize_t bytes_received = recv(socket_closer.sd, requestBuffer, buffer_size - 1, MSG_NOSIGNAL);
     if (bytes_received <= 0)
     {
         if (bytes_received == 0)
         {
-            // std::cout << "[" << std::this_thread::get_id() << "] Client disconnected socket " << socket_closer.sd << "\n"; // Debugging
+            // std::cout << "[" << std::this_thread::get_id() << "] Client disconnected socket " << socket_closer.sd << "\n"; // debugging
         }
         else
         {
-            // perror("recv error");                                                                                    // Debugging
-            // std::cout << "[" << std::this_thread::get_id() << "] Recv error on socket " << socket_closer.sd << "\n"; // Debugging
+            // perror("recv error");                                                                                    // debugging
+            // std::cout << "[" << std::this_thread::get_id() << "] Recv error on socket " << socket_closer.sd << "\n"; // debugging
         }
         return;
     }
-    buffer[bytes_received] = '\0';
+    requestBuffer[bytes_received] = '\0';
 
     // Parse http request msg
-    std::string request(buffer);
+    std::string request(requestBuffer);
     std::istringstream request_stream(request);
     std::string request_line;
     getline(request_stream, request_line); // read only the first line
@@ -265,7 +229,7 @@ void handleThreads(int newSd) // handle request from proxy
         std::cout << "server-response, " << responseCodeStr << ", "
                   << std::this_thread::get_id() << ", " << getCurrentTimestamp() << std::endl;
         send(socket_closer.sd, notFoundMsg.c_str(), notFoundMsg.length(), MSG_NOSIGNAL);
-        // std::cout << "[WebServer] Directory traversal attempt blocked: " << request_uri << std::endl; // debug
+        // std::cout << "[WebServer] Directory traversal attempt blocked: " << request_uri << std::endl; // debugging
         return;
     }
 
@@ -298,7 +262,7 @@ void handleThreads(int newSd) // handle request from proxy
         std::cout << "server-response, " << responseCodeStr << ", "
                   << std::this_thread::get_id() << ", " << getCurrentTimestamp() << std::endl;
         send(socket_closer.sd, notFoundMsg.c_str(), notFoundMsg.length(), MSG_NOSIGNAL);
-        // std::cout << "[WebServer] Unsupported file type requested: " << file_path << "\n"; // debug
+        // std::cout << "[WebServer] Unsupported file type requested: " << file_path << "\n"; // debugging
         return;
     }
 
@@ -312,7 +276,7 @@ void handleThreads(int newSd) // handle request from proxy
         std::cout << "server-response, " << responseCodeStr << ", "
                   << std::this_thread::get_id() << ", " << getCurrentTimestamp() << std::endl;
         send(socket_closer.sd, notFoundMsg.c_str(), notFoundMsg.length(), MSG_NOSIGNAL);
-        // std::cout << "[WebServer] File not found: " << file_path << "\n"; // debug
+        // std::cout << "[WebServer] File not found: " << file_path << "\n"; // debugging
         return;
     }
 
@@ -353,8 +317,7 @@ void handleThreads(int newSd) // handle request from proxy
     headers += "\r\n";                  // http header separator
 
     // Log before sending headers
-    std::cout << "server-response, " << responseCodeStr << ", "
-              << std::this_thread::get_id() << ", " << getCurrentTimestamp() << std::endl;
+    std::cout << "server-response, " << responseCodeStr << ", " << std::this_thread::get_id() << ", " << getCurrentTimestamp() << std::endl;
 
     // Send headers
     ssize_t sent_bytes = send(socket_closer.sd, headers.c_str(), headers.length(), MSG_NOSIGNAL);
@@ -373,7 +336,7 @@ void handleThreads(int newSd) // handle request from proxy
         // Check if server is shutting down between chunks (optional, but good for very large files)
         if (!serverRunning)
         {
-            // std::cerr << "Server shutting down during file transfer for " << file_path << "\n"; // debug
+            // std::cerr << "Server shutting down during file transfer for " << file_path << "\n"; // debugging
             break; // Exit loop, SocketCloser will handle cleanup
         }
 
@@ -391,12 +354,12 @@ void handleThreads(int newSd) // handle request from proxy
         {
             // For simplicity, treat this section as an error condition and break. (this should rarely occur w/ blocking sockets error)
             // For future reference: handle trying to send remaining chunks?
-            // std::cerr << "Warning: Sent fewer bytes than expected for chunk: " << chunk_sent_bytes << "/" << current_chunk_size << "\n";
+            // std::cerr << "Warning: Sent fewer bytes than expected for chunk: " << chunk_sent_bytes << "/" << current_chunk_size << "\n"; // debugging
             break;
         }
     }
     file.close();
-    // std::cout << "[" << std::this_thread::get_id() << "] Response sent for: " << file_path << " on socket " << socket_closer.sd << "\n";
+    // std::cout << "[" << std::this_thread::get_id() << "] Response sent for: " << file_path << " on socket " << socket_closer.sd << "\n"; // debugging
 }
 
 /*
@@ -405,7 +368,6 @@ void handleThreads(int newSd) // handle request from proxy
 
 int main(int argc, char *argv[])
 {
-    // For the server, we only need to specify a port number
     if (argc != 2)
     {
         std::cerr << "Usage: " << argv[0] << " <web_server_port>" << std::endl;
@@ -435,7 +397,6 @@ int main(int argc, char *argv[])
     if (serverSd < 0)
     {
         perror("Error establishing the server socket");
-        // close(serverSd);
         exit(1);
     }
 
@@ -462,7 +423,7 @@ int main(int argc, char *argv[])
     // listen for up to SOMAXCONN requests at a time
     if (listen(serverSd, SOMAXCONN) < 0)
     {
-        perror("Error listening on socket");
+        perror("[WebServer] Error listening on socket");
         close(serverSd);
         exit(1);
     }
@@ -477,26 +438,26 @@ int main(int argc, char *argv[])
         socklen_t newSockAddrSize = sizeof(newSockAddr);
         // Accept, create a new socket descriptor to
         // Handle the new connection with client
-        int newSd = accept(serverSd, (sockaddr *)&newSockAddr, &newSockAddrSize);
+        int clientSd = accept(serverSd, (sockaddr *)&newSockAddr, &newSockAddrSize);
 
         if (!serverRunning) // check flag immediately after accept returns
         {
-            if (newSd >= 0)
-                close(newSd); // close newly accepted socket if shutting down
-            break;            // exit loop if serverRunning is false
+            if (clientSd >= 0)
+                close(clientSd); // close newly accepted socket if shutting down
+            break;               // exit loop if serverRunning is false
         }
 
-        if (newSd < 0) // handle accept errors
+        if (clientSd < 0) // handle accept errors
         {
             // EINTR means accept was interrupted by our signal (okay if shutting down)
             if (errno == EINTR && !serverRunning)
             {
-                // std::cout << "accept() interrupted gracefully during shutdown." << std::endl; // Debugging
+                // std::cout << "accept() interrupted gracefully during shutdown." << std::endl; // debugging
                 break;
             }
             else if (errno != EINTR) // log other errors if not shutting down
             {
-                perror("[WebServer] Error accepting request from client (proxy)");
+                perror("[WebServer] Error accepting client connection request");
                 // For future reference:
                 // decide if error is fatal. for errors like (e.g. EMFILE, ENFILE),
                 // it might be better to pause and retry rather than exit
@@ -507,76 +468,36 @@ int main(int argc, char *argv[])
             }
             // If errno == EINTR but serverRunning is still true, it was interrupted by something else.
             // Just continue the loop.
-            std::cout << "accept() interrupted but server still running (errno=" << errno << ")" << std::endl; // Debugging
+            std::cout << "accept() interrupted but server still running (errno=" << errno << ")" << std::endl; // debugging
             continue;
         }
 
         // Connection accepted
         try
         {
-            // Add client socket (from proxy) to tracking list
+            // Add client socket to tracking list
             {
                 std::lock_guard<std::mutex> lock(clientSocketsMutex);
-                clientSockets.push_back(newSd);
-                // std::cout << "[WebServer] Added proxy socket " << newSd << " to tracking list." << std::endl; // debuggin
+                clientSockets.push_back(clientSd);
+                // std::cout << "[WebServer] Added proxy socket " << clientSd << " to tracking list." << std::endl; // debuggin
             }
 
             // Create and manage worker thread
-            std::thread workerThread(handleThreads, newSd);
+            std::thread workerThread(handleRequest, clientSd);
             {
-                std::lock_guard<std::mutex> lock(threadMutex); // protect threads vector
-                threads.push_back(std::move(workerThread));
-                // std::cout << "[WebServer] Launched thread " << threads.back().get_id() << " for socket " << newSd << std::endl; // debugging
+                std::lock_guard<std::mutex> lock(threadMutex);
+                threads.push_back(std::move(workerThread)); // transer ownership of threads to vector (to join later )
+                // std::cout << "[WebServer] Launched thread " << threads.back().get_id() << " for socket " << clientSd << std::endl; // debugging
             }
         }
         catch (const std::exception &e)
         {
             std::cerr << "[WebServer] Error creating thread: " << e.what() << '\n';
-            removeClientSocket(newSd); // clean up tracking vector
-            close(newSd);
+            removeClientSocket(clientSd);
+            close(clientSd);
         }
     }
 
     std::cout << "[WebServer] Server loop finished." << std::endl;
-
     return 0;
 }
-
-/*
-   Notes for myself:
-   -Globals: include the trailing \r\n\r\n. This is problematic when combined with successMsg later.
-
-   -Request reading: null-terminates, okay for simple requests but vulnerable to very long requests if exceeding buffer-size before \r\n
-   Also, it only reads once, potentially missing parts of large requests (though usually the initial request line fits).
-
-   -Request Parsing: Basic parsing of the first line. Ignores headers. Works for simple GET requests.
-
-   -File Path Handling: file_path.empty() check is good. The subsequent !fileExists(file_path) check is also correct.
-   Sending the full notFoundMsg is right. Improvement: You should handle the case where request_uri is just "/".
-   Typically, this should serve a default file like "index.html".
-
-   -File Type Detection: file_path.find(".ext") is weak. It matches the substring anywhere. E.g., my.html.backup would match .html.
-   It's better to check if the string ends with the extension.
-
-   -HTML Response Construction: Issue: This lacks a Content-Length header for the actual fileContent being sent.
-   Also, htmlType incorrectly includes \r\n\r\n. The browser might render it, but it's not a standard-compliant response.
-
-   -JPEG/PDF Response Construction: Issue: Better, but still flawed. jpegType/pdfType include \r\n\r\n.
-   The first send sends the status line and the Content-Type header plus an premature end-of-headers marker.
-   The second send sends the body. Crucially, there's no Content-Length header sent before the body.
-
-   -File Reading: (string fileContent((istreambuf_iterator<char>(file)), istreambuf_iterator<char>());)
-   This reads the entire file into memory (into the fileContent string). This is simple but very inefficient for large files.
-   A 1GB file would try to allocate 1GB of RAM. A better approach is to read and send the file in chunks.
-
-   -Error Handling (ifstream::is_open): You check !file.is_open(), print an error, but you don't return.
-   The code will proceed to use the invalid fileContent string, likely crashing or sending garbage.
-   You need to close(newSd) and return; if the file can't be opened.
-
-   send() Return Value: You don't check the return value of send(). It can send fewer bytes than requested, or fail entirely.
-   Robust code should handle this, potentially looping until all data is sent or an error occurs.
-
-   -Potential High Memory Usage (Not a Leak): Reading entire files into std::string can consume vast amounts of memory for large files,
-   but this memory is freed when the fileContent string goes out of scope at the end of handleThreads. This isn't a leak, but it's a
-   scalability issue.
-   */
